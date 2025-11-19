@@ -1,1 +1,610 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from astropy.io import fits
+from astropy.table import Table
+from astropy.wcs import WCS
+from astropy.stats import SigmaClip, sigma_clipped_stats
+from photutils.background import Background2D, MedianBackground
+from photutils.segmentation import detect_threshold, detect_sources, deblend_sources, SourceCatalog
+from photutils.aperture import CircularAperture, CircularAnnulus, aperture_photometry
 
+'''
+Configuration of Parameters and path
+'''
+path = r"C:\Users\emili\OneDrive - Imperial College London\Year 3\Lab\Astronomical Imaging\Astro Data\Astro\Fits_Data\mosaic.fits"
+SEG_NSIG, SEG_MINAREA = 2.5, 20
+DEBLEND_NTHRESH, DEBLEND_CONTRAST = 32, 0.01
+pixel_scale = 0.258  # arcsec/pixel
+
+data, hdr = fits.getdata(path, header=True)
+data = np.nan_to_num(data, nan=0.0, posinf=0.0, neginf=0.0)
+
+ZP = hdr.get('MAGZPT', 25.0)
+ZP_err = hdr.get('MAGZRR', 0.0)
+GAIN = hdr.get('GAIN', hdr.get('EGAIN', 1.0))       # e-/ADU
+EXPTIME = hdr.get('EXPTIME', hdr.get('EXPOSURE', 1.0))
+
+badmask = np.zeros_like(data, dtype=bool)
+
+'''
+Masking unusable regions
+'''
+def add_triangle_mask(badmask, x_start, x_end, y_bottom, y_top):
+    ny, nx = badmask.shape
+    x_center = 0.5 * (x_start + x_end)
+    half_width_bottom = 0.5 * (x_end - x_start)
+    for y in range(y_bottom, y_top + 1):
+        t = (y - y_bottom) / (y_top - y_bottom)
+        half_width_y = half_width_bottom * (1 - t)
+        x_left = int(np.round(x_center - half_width_y))
+        x_right = int(np.round(x_center + half_width_y))
+        x_left = max(x_left, 0)
+        x_right = min(x_right, nx - 1)
+        badmask[y, x_left:x_right + 1] = True
+    return badmask
+
+def add_circle_mask(badmask, centre, radius):
+    ny, nx = badmask.shape
+    y, x = np.ogrid[:ny, :nx]
+    cx, cy = centre
+    circle = (x - cx) ** 2 + (y - cy) ** 2 <= radius ** 2
+    badmask[circle] = True
+    return badmask
+
+def add_rectangle_mask(badmask, x_min, x_max, y_min, y_max):
+    badmask[y_min:y_max, x_min:x_max] = True
+    return badmask
+
+triangles = [
+    (1258, 1554, 429, 490),
+    (1260, 1564, 318, 375),
+    (1396, 1475, 232, 282),
+    (1400, 1471, 218, 243),
+    (1292, 1521, 123, 178),
+    (1390, 1466, 116, 135),
+    (1238, 1559, 5, 72),
+]
+for (xs, xe, yb, yt) in triangles:
+    badmask = add_triangle_mask(badmask, xs, xe, yb, yt)
+
+badmask[:, 1426:1449] = True
+badmask[426:430, 1194:1650] = True
+badmask[314:318, 1017:1674] = True
+badmask[0:4, 971:1723] = True
+
+ny, nx = data.shape
+centre = (1440, 3210)
+radius = 1440 - 1129
+badmask = add_circle_mask(badmask, centre, radius)
+badmask = add_rectangle_mask(badmask, 1426, 1449, 0, ny)
+
+badmask = add_circle_mask(badmask, (905, 2287), 40)
+badmask = add_rectangle_mask(badmask, 897, 910, 2222, 2359)
+
+badmask = add_circle_mask(badmask, (972, 2780), 35)
+badmask = add_rectangle_mask(badmask, 969, 977, 2702, 2836)
+badmask = add_circle_mask(badmask, (985, 2809), 11)
+
+badmask = add_circle_mask(badmask, (774, 3322), 40)
+badmask = add_rectangle_mask(badmask, 774, 782, 3210, 3418)
+
+badmask = add_circle_mask(badmask, (2134, 3762), 40)
+badmask = add_rectangle_mask(badmask, 2134, 2142, 3714, 3802)
+
+badmask = add_rectangle_mask(badmask, 1426, 1449, 0, ny)
+badmask = add_rectangle_mask(badmask, 1194, 1650, 426, 430)
+badmask = add_rectangle_mask(badmask, 1017, 1674, 314, 318)
+badmask = add_rectangle_mask(badmask, 971, 1723, 0, 4)
+
+'''
+Background gradient
+'''
+
+bkg = Background2D(
+    data,
+    box_size=64,
+    filter_size=(3, 3),
+    bkg_estimator=MedianBackground(),
+    sigma_clip=SigmaClip(3, 5),
+    mask=badmask,
+)
+img = data - bkg.background
+
+'''
+Detection code
+'''
+
+try:
+    w = WCS(hdr)
+    _ = w.pixel_to_world(0, 0)
+except Exception:
+    w = None
+
+thr = detect_threshold(img, nsigma=SEG_NSIG, mask=badmask)
+seg = detect_sources(img, thr, npixels=SEG_MINAREA, connectivity=8, mask=badmask)
+
+if seg is None:
+    print("No sources found.")
+    cat_tab = Table()
+else:
+    seg = deblend_sources(
+        img,
+        seg,
+        npixels=SEG_MINAREA,
+        nlevels=DEBLEND_NTHRESH,
+        contrast=DEBLEND_CONTRAST,
+    )
+    cat = SourceCatalog(
+        img,
+        seg,
+        background=bkg.background,
+        error=bkg.background_rms,
+        wcs=w,
+        mask=badmask,
+    )
+    cat_tab = cat.to_table()
+
+    if 'sky_centroid' in cat_tab.colnames:
+        cat_tab.remove_column('sky_centroid')
+
+    if 'id' not in cat_tab.colnames:
+        if 'label' in cat_tab.colnames:
+            cat_tab['id'] = cat_tab['label']
+        else:
+            cat_tab['id'] = np.arange(1, len(cat_tab) + 1, dtype=int)
+
+    if 'kron_flux' in cat_tab.colnames:
+        flux_cat = np.array(cat_tab['kron_flux'], dtype=float)
+    elif 'segment_flux' in cat_tab.colnames:
+        flux_cat = np.array(cat_tab['segment_flux'], dtype=float)
+    elif 'source_sum' in cat_tab.colnames:
+        flux_cat = np.array(cat_tab['source_sum'], dtype=float)
+    else:
+        flux_cat = np.zeros(len(cat_tab), dtype=float)
+
+    cat_tab['flux'] = flux_cat
+    flux_rate_cat = np.clip(flux_cat, 1e-12, None) * GAIN / EXPTIME
+    cat_tab['mag_inst'] = -2.5 * np.log10(flux_rate_cat)
+    cat_tab['mag_cal'] = ZP + cat_tab['mag_inst']
+    cat_tab['mag_cal_err'] = ZP_err
+
+   '''
+   Variable Aperture Photometry
+   '''
+    if len(cat_tab) and 'xcentroid' in cat_tab.colnames and 'ycentroid' in cat_tab.colnames:
+        if 'kron_radius' in cat_tab.colnames:
+            aper_r = np.array(cat_tab['kron_radius'], dtype=float)
+        else:
+            aper_r = np.sqrt(np.array(cat_tab['area'], dtype=float) / np.pi)
+
+        xcen = np.array(cat_tab['xcentroid'], dtype=float)
+        ycen = np.array(cat_tab['ycentroid'], dtype=float)
+
+        aper_sum = []
+        aper_area = []
+        bkg_median = []
+        bkg_std = []
+
+        for x, y, r in zip(xcen, ycen, aper_r):
+            r = float(r)
+            if not np.isfinite(r) or r <= 0:
+                aper_sum.append(0.0)
+                aper_area.append(0.0)
+                bkg_median.append(0.0)
+                bkg_std.append(0.0)
+                continue
+
+            aper_i = CircularAperture((x, y), r=r)
+            ann_i = CircularAnnulus((x, y), r_in=1.5 * r, r_out=2.5 * r)
+
+            phot_i = aperture_photometry(data, [aper_i, ann_i])
+            aper_sum.append(phot_i['aperture_sum_0'][0])
+            aper_area.append(aper_i.area)
+
+            ann_mask = ann_i.to_mask(method='center')
+            ann_data = ann_mask.multiply(data)
+            ann_data_1d = ann_data[ann_mask.data > 0]
+            if len(ann_data_1d) > 0:
+                _, med, std = sigma_clipped_stats(ann_data_1d, sigma=3.0, maxiters=5)
+            else:
+                med, std = 0.0, 0.0
+            bkg_median.append(med)
+            bkg_std.append(std)
+
+        aper_sum = np.array(aper_sum)
+        aper_area = np.array(aper_area)
+        bkg_median = np.array(bkg_median)
+        bkg_std = np.array(bkg_std)
+
+        bkg_total = bkg_median * aper_area
+        flux_net = aper_sum - bkg_total  # ADU
+
+        var_e = np.clip(aper_sum, 0, None) * GAIN + aper_area * (bkg_std * GAIN) ** 2
+        sigma_flux_e = np.sqrt(var_e)
+
+        flux_net_e = flux_net * GAIN
+        flux_rate_e = flux_net_e / EXPTIME
+        sigma_flux_rate_e = sigma_flux_e / EXPTIME
+
+        mag_ap_inst = np.full(len(cat_tab), np.nan)
+        mag_ap_err_meas = np.full(len(cat_tab), np.nan)
+
+        good_flux = (flux_rate_e > 0) & np.isfinite(sigma_flux_rate_e) & (sigma_flux_rate_e > 0)
+        snr = np.zeros_like(flux_rate_e)
+        snr[good_flux] = flux_rate_e[good_flux] / sigma_flux_rate_e[good_flux]
+
+        SNR_MIN = 3.0
+        good = good_flux & (snr >= SNR_MIN)
+
+        mag_ap_inst[good] = -2.5 * np.log10(flux_rate_e[good])
+        mag_ap_err_meas[good] = 1.0857 / snr[good]
+
+        mag_ap_cal = ZP + mag_ap_inst
+        mag_ap_cal_err = np.sqrt(mag_ap_err_meas ** 2 + ZP_err ** 2)
+
+        cat_tab['aper_sum'] = aper_sum
+        cat_tab['aper_area'] = aper_area
+        cat_tab['bkg_median'] = bkg_median
+        cat_tab['bkg_std'] = bkg_std
+        cat_tab['bkg_total'] = bkg_total
+        cat_tab['flux_ap_net'] = flux_net
+        cat_tab['mag_ap_inst'] = mag_ap_inst
+        cat_tab['mag_ap_cal'] = mag_ap_cal
+        cat_tab['mag_ap_cal_err'] = mag_ap_cal_err
+        cat_tab['mag_ap_err_meas'] = mag_ap_err_meas
+
+'''
+Removing objects above saturation threshold
+'''
+
+if len(cat_tab):
+    threshold = hdr.get('SATURATE')
+
+    remove_ids = []
+
+    print(f"\nChecking for objects with pixels > {threshold} ...")
+    for row in cat_tab:
+        obj_id = row['id']
+        mask_seg = (seg.data == obj_id)
+        if not np.any(mask_seg):
+            continue
+
+        vals = data[mask_seg]
+        max_val = vals.max()
+        if max_val > threshold:
+            coords = np.argwhere(mask_seg)
+            idx_max = np.argmax(vals)
+            y_max, x_max = coords[idx_max]
+            print(
+                f"Removing id={obj_id}: max pixel={max_val:.1f} "
+                f"at (x={x_max}, y={y_max})"
+            )
+            remove_ids.append(obj_id)
+
+    if remove_ids:
+        keep = ~np.in1d(cat_tab['id'], remove_ids)
+        cat_tab = cat_tab[keep]
+        print(f"Removed {len(remove_ids)} objects with pixels > {threshold}.")
+    else:
+        print("No objects exceeded the pixel threshold.")
+
+'''
+Saving detections
+'''
+
+if len(cat_tab):
+    cat_tab.write('catalog_all_mosaic.fits', overwrite=True)
+    cat_tab.write('catalog_all_mosaic.csv', overwrite=True)
+
+print("\n===== FULL CATALOG for mosaic (after cleaning) =====")
+print(cat_tab)
+print(f"\n[mosaic] All detections after cleaning: {len(cat_tab)}\n")
+
+'''
+Image of detections
+'''
+
+plt.figure(figsize=(12, 8))
+plt.imshow(
+    img,
+    origin='lower',
+    cmap='viridis',
+    vmin=np.percentile(img, 5),
+    vmax=np.percentile(img, 99),
+)
+if len(cat_tab) and 'xcentroid' in cat_tab.colnames and 'ycentroid' in cat_tab.colnames:
+    plt.scatter(
+        cat_tab['xcentroid'],
+        cat_tab['ycentroid'],
+        s=20,
+        facecolors='none',
+        edgecolors='orange',
+        label='all',
+    )
+#plt.colorbar(label='bkg-sub pixel')
+#plt.legend()
+plt.xlabel('Pixel Number x' ,fontsize=20)
+plt.ylabel('Pixel Number y' ,fontsize=20)
+plt.title('Detections with σ=2.5, area=20, d_cont = 0.01', fontsize=20)
+plt.xticks(fontsize=15)
+plt.yticks(fontsize=15)
+plt.tight_layout()
+plt.show()
+
+'''
+Number count plot
+'''
+
+if len(cat_tab) and 'mag_ap_cal' in cat_tab.colnames:
+    mags = np.array(cat_tab['mag_ap_cal'])
+    mask = np.isfinite(mags)
+    mags = mags[mask]
+    if len(mags) > 0:
+        bin_width = 0.5
+        bins = np.arange(mags.min(), mags.max() + bin_width, bin_width)
+
+        N_raw, _ = np.histogram(mags, bins=bins)
+        N_cum = np.cumsum(N_raw)
+
+        area_pix = np.count_nonzero(~badmask)
+        pix_scale_deg = pixel_scale / 3600.0
+        area_deg2 = area_pix * (pix_scale_deg ** 2)
+
+        N_cum_area = N_cum / area_deg2
+
+        bin_mids = 0.5 * (bins[1:] + bins[:-1])
+
+        maskN = N_cum > 0
+        bins_p = bin_mids[maskN]
+        N_p = N_cum_area[maskN]
+
+        logN = np.log10(N_p.astype(float))
+        logN_err = 0.434 / np.sqrt(N_cum[maskN].astype(float))
+
+        # --- bright-end fit: 15–18 mag ---
+        fit_mask = (bins_p >= 15.0) & (bins_p <= 18)
+        x_fit = bins_p[fit_mask]
+        y_fit = logN[fit_mask]
+        y_err_fit = logN_err[fit_mask]
+
+        x_model = y_model = None
+        if len(x_fit) >= 2:
+            w = 1.0 / np.clip(y_err_fit, 1e-6, None)
+            p,cov = np.polyfit(x_fit, y_fit, 1, w=w, cov=True)
+            x_model = np.linspace(bins_p.min(), bins_p.max(), 200)
+            y_model = p[0] * x_model + p[1]
+        else:
+            p = [np.nan, np.nan]
+
+        # placeholders for second (faint-end) fit
+        x_model_faint = y_model_faint = None
+        p_faint = [np.nan, np.nan]
+
+        plt.figure()
+
+        
+        bright_mask = bins_p <= 24.3
+        faint_mask = bins_p > 24.3
+
+        
+        plt.errorbar(
+            bins_p[bright_mask],
+            logN[bright_mask],
+            yerr=logN_err[bright_mask],
+            fmt='o-',
+            capsize=2,
+            alpha=0.3,
+            label='Data',
+            color='black',
+        )
+        
+        plt.errorbar(
+            bins_p[faint_mask],
+            logN[faint_mask],
+            yerr=logN_err[faint_mask],
+            fmt='o',
+            capsize=2,
+            alpha=0.3,
+            color='black',
+        )
+
+        
+        if x_model is not None:
+            plt.plot(
+                x_model,
+                y_model,
+                color='red',
+                linewidth=2,
+                label=f'Fit 16–18 mag (slope={p[0]:.3f})',
+            )
+
+        '''
+        Completeness og 90% and 50%
+        '''
+
+        N_diff = N_raw
+        diff_mask = N_diff > 0
+        m_diff = bin_mids[diff_mask]
+        N_diff_obs = N_diff[diff_mask].astype(float)
+
+        logN_diff = np.log10(N_diff_obs)
+        logN_diff_err = 0.434 / np.sqrt(N_diff_obs)
+
+        fit_mask2 = (m_diff >= 15.0) & (m_diff <= 18)
+        x_fit2 = m_diff[fit_mask2]
+        y_fit2 = logN_diff[fit_mask2]
+        y_err_fit2 = logN_diff_err[fit_mask2]
+
+        C90_mag = None
+        C50_mag = None
+
+        if len(x_fit2) >= 2:
+            w2 = 1.0 / np.clip(y_err_fit2, 1e-6, None)
+            p2 = np.polyfit(x_fit2, y_fit2, 1, w=w2)
+
+            logN_model_all = p2[0] * bin_mids + p2[1]
+            N_model_all = 10.0 ** logN_model_all
+
+            mask_model = N_model_all > 0
+            m_comp = bin_mids[mask_model]
+            N_obs_comp = N_raw[mask_model].astype(float)
+            N_model_comp = N_model_all[mask_model]
+
+            C = N_obs_comp / N_model_comp
+
+            start_mag = 18.0
+
+            def first_crossing_after(m_arr, C_arr, level, start_mag):
+                mask = (m_arr >= start_mag) & (C_arr <= level)
+                if not np.any(mask):
+                    return None
+                return m_arr[mask][0]
+
+            C90_mag = first_crossing_after(m_comp, C, 0.9, start_mag)
+            C50_mag = first_crossing_after(m_comp, C, 0.5, start_mag)
+
+            ymin = np.nanmin(logN)
+            ymax = np.nanmax(logN)
+
+            if C90_mag is not None:
+                plt.axvline(C90_mag, color='green', linestyle='--', alpha=0.7)
+                plt.text(
+                    C90_mag + 0.1,
+                    ymin + 0.1 * (ymax - ymin),
+                    '90% comp',
+                    color='green',
+                    fontsize=10,
+                )
+                print(f"~90% completeness at m ≈ {C90_mag:.2f}")
+
+            if C50_mag is not None:
+                plt.axvline(C50_mag, color='red', linestyle='--', alpha=0.7)
+                plt.text(
+                    C50_mag + 0.1,
+                    ymin + 0.25 * (ymax - ymin),
+                    '50% comp',
+                    color='red',
+                    fontsize=10,
+                )
+                print(f"~50% completeness at m ≈ {C50_mag:.2f}")
+
+                faint_fit_mask = (bins_p >= 18) & (bins_p <= C50_mag)
+                x_fit_faint = bins_p[faint_fit_mask]
+                y_fit_faint = logN[faint_fit_mask]
+                y_err_faint = logN_err[faint_fit_mask]
+
+                if len(x_fit_faint) >= 2:
+                    w_faint = 1.0 / np.clip(y_err_faint, 1e-6, None)
+                    p_faint,cov_faint = np.polyfit(x_fit_faint, y_fit_faint, 1, w=w_faint, cov=True)
+                    # extend this fit over a reasonable faint range
+                    x_model_faint = np.linspace(18, bins_p.max(), 200)
+                    y_model_faint = p_faint[0] * x_model_faint + p_faint[1]
+  
+
+        if x_model_faint is not None:
+            plt.plot(
+                x_model_faint,
+                y_model_faint,
+                color='blue',
+                linestyle='--',
+                linewidth=2,
+                label=f'Fit 18–50% comp (slope={p_faint[0]:.3f})',
+            )
+
+        plt.xlabel('Magnitude m (r band)', fontsize=15)
+        plt.ylabel(r'$\log_{10} N(<m)\ \mathrm{[deg^{-2}]}$ per 0.5 mag',fontsize=15)
+        plt.title('Number Count per deg$^2$',fontsize=15)
+        plt.grid(True, alpha=0.3)
+        plt.xlim(13.5, 25)
+        plt.ylim(0.7, 5.1)
+        plt.xticks(fontsize=15)
+        plt.yticks(fontsize=15)
+        plt.legend(fontsize=11)
+        plt.tight_layout()
+        plt.show()
+        
+
+'''
+Cosmic variance and testing uniformity
+'''
+
+if len(cat_tab) and 'xcentroid' in cat_tab.colnames and 'ycentroid' in cat_tab.colnames:
+    print("===== Counts-in-cells variance analysis =====")
+
+    # number of segments in x and y (can adjust)
+    N_XSEG, N_YSEG = 2, 3
+
+    dx = nx / N_XSEG
+    dy = ny / N_YSEG
+
+    x = np.array(cat_tab['xcentroid'], dtype=float)
+    y = np.array(cat_tab['ycentroid'], dtype=float)
+
+    # map each source to a cell index (ix, iy)
+    ix = np.clip((x / dx).astype(int), 0, N_XSEG - 1)
+    iy = np.clip((y / dy).astype(int), 0, N_YSEG - 1)
+
+    N_cells = np.zeros((N_YSEG, N_XSEG), dtype=int)
+    for j_cell, i_cell in zip(iy, ix):
+        N_cells[j_cell, i_cell] += 1
+
+    cell_counts = []
+    valid_cells = []
+    for j in range(N_YSEG):
+        y0 = int(j * dy)
+        y1 = int((j + 1) * dy)
+        y1c = min(y1, ny)
+        for i in range(N_XSEG):
+            x0 = int(i * dx)
+            x1 = int((i + 1) * dx)
+            x1c = min(x1, nx)
+
+            submask = badmask[y0:y1c, x0:x1c]
+            if submask.size == 0:
+                continue
+
+            good_frac = 1.0 - submask.mean()  # fraction of unmasked pixels
+            # require that at least half the cell is usable
+            if good_frac < 0.5:
+                continue
+
+            cell_counts.append(N_cells[j, i])
+            valid_cells.append((j, i, good_frac))
+
+    cell_counts = np.array(cell_counts, dtype=float)
+    k = len(cell_counts)
+
+    if k < 2:
+        print("Not enough valid cells for variance analysis (k < 2).")
+    else:
+        N_bar = cell_counts.mean()
+        sigma_obs = cell_counts.std(ddof=1)
+        sigma_exp = np.sqrt(N_bar)
+        ratio = sigma_obs / sigma_exp if sigma_exp > 0 else np.nan
+
+        print(f"Using {k} valid cells out of {N_XSEG * N_YSEG}")
+        print(f"Mean count per cell N̄             = {N_bar:.3f}")
+        print(f"Observed std σ_obs                 = {sigma_obs:.3f}")
+        print(f"Poisson expected std √N̄           = {sigma_exp:.3f}")
+        print(f"Ratio σ_obs / √N̄                  = {ratio:.3f}")
+
+
+        try:
+            from scipy import stats
+
+            if N_bar > 0:
+                chi2 = (k - 1) * (sigma_obs ** 2) / N_bar
+                p_value = stats.chi2.sf(chi2, k - 1)
+                print(f"Chi² = {chi2:.3f} for {k-1} dof, p-value = {p_value:.3g}")
+                if p_value < 0.05:
+                    print("→ Variance is significantly larger than Poisson expectation "
+                          "(evidence for non-uniform / clustered distribution).")
+                else:
+                    print("→ Variance is consistent with Poisson expectation "
+                          "within statistical uncertainties.")
+            else:
+                print("Mean count per cell is zero or negative; cannot perform chi-square test.")
+        except ImportError:
+            print("scipy not available; skipping formal chi-square test.")
+else:
+    print("No catalog / centroids available; skipping variance analysis.")
