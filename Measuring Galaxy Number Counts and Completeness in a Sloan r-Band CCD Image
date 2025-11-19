@@ -168,9 +168,8 @@ else:
     cat_tab['mag_cal'] = ZP + cat_tab['mag_inst']
     cat_tab['mag_cal_err'] = ZP_err
 
-   '''
-   Variable Aperture Photometry
-   '''
+#   Variable Aperture Photometry
+
     if len(cat_tab) and 'xcentroid' in cat_tab.colnames and 'ycentroid' in cat_tab.colnames:
         if 'kron_radius' in cat_tab.colnames:
             aper_r = np.array(cat_tab['kron_radius'], dtype=float)
@@ -418,9 +417,9 @@ if len(cat_tab) and 'mag_ap_cal' in cat_tab.colnames:
                 label=f'Fit 16–18 mag (slope={p[0]:.3f})',
             )
 
-        '''
-        Completeness og 90% and 50%
-        '''
+
+#        Completeness og 90% and 50%
+
 
         N_diff = N_raw
         diff_mask = N_diff > 0
